@@ -1,0 +1,927 @@
+import xml.etree.ElementTree as ET
+import numpy as np
+from scipy.spatial import Delaunay
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+from matplotlib.path import Path
+import matplotlib.patches as patches
+import copy
+from typing import Dict, List, Tuple, Optional
+import math
+from scipy.interpolate import interp1d
+from scipy.spatial import ConvexHull  # For point-in-poly check
+import matplotlib.path as mpath  # For point-in-polygon
+from svg.path import parse_path
+import os
+
+class Camera:
+    """相机类，表示观察视角，基于角色中心的球面坐标系"""
+    def __init__(self, yaw: float = 0, pitch: float = 0, 
+                 image_width: int = 210, image_height: int = 297, 
+                 anchor_3d: Optional[np.ndarray] = None, radius: float = 10.0):
+        self.yaw = yaw    # 逆时针旋转围绕垂直轴 (Y轴)，范围 [-π, π]
+        self.pitch = pitch  # 顺时针旋转围绕水平轴 (X轴)，正值向下，范围 [-π/2, π/2]
+        self.image_width = image_width
+        self.image_height = image_height
+        self.anchor_3d = np.array([0, 0, 0]) if anchor_3d is None else anchor_3d  # 角色3D中心
+        self.radius = radius  # 相机到角色的距离
+
+        # 计算相机位置 (球面坐标)
+        cos_pitch = math.cos(pitch)
+        sin_pitch = math.sin(pitch)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+
+        # 相机位置 (X, Y, Z) 相对于anchor，Z向前，Y向上，X向右
+        self.position = self.anchor_3d + np.array([
+            self.radius * cos_pitch * sin_yaw,  # X
+            self.radius * sin_pitch,            # Y
+            -self.radius * cos_pitch * cos_yaw  # Z (负值因为Z向前)
+        ])
+
+        # 计算方向向量
+        self.forward = -(self.position - self.anchor_3d) / self.radius  # 朝向anchor
+        self.up = np.array([0, 1, 0])  # 初始向上向量
+        self.right = np.cross(self.forward, self.up)  # 右向量
+        self.up = np.cross(self.right, self.forward)  # 重新计算up确保正交
+        self.up /= np.linalg.norm(self.up)  # 归一化
+        self.right /= np.linalg.norm(self.right)  # 归一化
+
+class Stroke:
+    def __init__(self, stroke_id: str):
+        self.id = stroke_id
+        self.key_views: Dict[Tuple[float, float], np.ndarray] = {}
+        self.anchor_3d: Optional[np.ndarray] = None
+        self.has_anchor = True
+        self.group_id: Optional[str] = None
+        self.styles: Dict[str, str] = {}     # e.g., {'fill': '#ffcc00', 'stroke': '#000', 'stroke-width': '1'}
+        self.areas: Dict[Tuple[float, float], float] = {}  # 记录每个视角下的多边形面积
+        self.visibility_regions: List[List[Tuple[float, float]]] = []  # e.g., [[(yaw1,pitch1), (yaw2,pitch2), ...]]
+
+def _polygon_area(points: np.ndarray) -> float:
+    if points is None or len(points) < 3:
+        return 0.0
+    x = points[:, 0]
+    y = points[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+class StrokeGroup:
+    """表示一组相关的笔画"""
+    def __init__(self, group_id: str):
+        self.id = group_id
+        self.strokes: List[Stroke] = []
+        self.anchor_3d: Optional[np.ndarray] = None
+
+class CartoonModel2_5D:
+    """2.5D卡通模型"""
+    def __init__(self, image_width: int = 210, image_height: int = 297):
+        self.strokes: Dict[str, Stroke] = {}
+        self.groups: Dict[str, StrokeGroup] = {}
+        self.key_views: List[Tuple[float, float]] = []
+        self.delaunay: Optional[Delaunay] = None
+        self.image_width = image_width
+        self.image_height = image_height
+        self.view_orders: Dict[Tuple[float, float], List[str]] = {}  # Store order per view
+
+    def add_key_view(self, camera: Camera, svg_data: Dict[str, np.ndarray], styles: Optional[Dict[str, Dict[str, str]]] = None, order: List[str] = None):
+        """添加关键视角；svg_data 可来自 parse_svg_file 的第一返回值；styles 为第二返回值；order 为第三返回值"""
+        view_key = (camera.yaw, camera.pitch)
+        if view_key not in self.key_views:
+            self.key_views.append(view_key)
+        if order:
+            self.view_orders[view_key] = order
+
+        for stroke_id, path_points in svg_data.items():
+            if stroke_id not in self.strokes:
+                self.strokes[stroke_id] = Stroke(stroke_id)
+
+            resampled_points = self._resample_path(path_points, 100)
+            self.strokes[stroke_id].key_views[view_key] = resampled_points
+            self.strokes[stroke_id].areas[view_key] = abs(_polygon_area(resampled_points))
+            if styles and not self.strokes[stroke_id].styles:
+                self.strokes[stroke_id].styles = styles.get(stroke_id, {})
+
+    def center_views(self):
+        """Align centroids across all views to image center."""
+        global_centroids = {}
+        for view in self.key_views:
+            view_points = []
+            for stroke in self.strokes.values():
+                if view in stroke.key_views:
+                    view_points.append(stroke.key_views[view])
+            if view_points:
+                all_points = np.vstack(view_points)
+                global_centroids[view] = np.mean(all_points, axis=0)
+
+        for view in self.key_views:
+            if view in global_centroids:
+                shift = np.array([self.image_width / 2, self.image_height / 2]) - global_centroids[view]
+                for stroke in self.strokes.values():
+                    if view in stroke.key_views:
+                        stroke.key_views[view] += shift
+                        stroke.areas[view] = abs(_polygon_area(stroke.key_views[view]))
+
+    def _resample_path(self, points: np.ndarray, num_points: int) -> np.ndarray:
+        """重采样路径到固定点数"""
+        if len(points) <= 1:
+            return points
+            
+        # 计算累积距离
+        distances = np.zeros(len(points))
+        for i in range(1, len(points)):
+            distances[i] = distances[i-1] + np.linalg.norm(points[i] - points[i-1])
+        
+        if distances[-1] == 0:  # 所有点重合
+            return np.tile(points[0], (num_points, 1))
+        
+        # 归一化距离
+        normalized_distances = distances / distances[-1]
+        
+        # 创建插值函数
+        interp_x = interp1d(normalized_distances, points[:, 0], kind='linear')
+        interp_y = interp1d(normalized_distances, points[:, 1], kind='linear')
+        
+        # 在新距离上采样
+        new_distances = np.linspace(0, 1, num_points)
+        new_x = interp_x(new_distances)
+        new_y = interp_y(new_distances)
+        
+        return np.column_stack([new_x, new_y])
+    
+    def compute_3d_anchors(self):
+        """计算所有笔画的3D anchor点"""
+        for stroke_id, stroke in self.strokes.items():
+            if not stroke.has_anchor:
+                continue
+                
+            centers_2d = []
+            camera_poses = []
+            
+            for (yaw, pitch), path_points in stroke.key_views.items():
+                # 计算2D中心点
+                center_2d = np.mean(path_points, axis=0)
+                centers_2d.append(center_2d)
+                
+                # 创建相机 (remove the 0 for tilt)
+                camera = Camera(yaw, pitch, self.image_width, self.image_height)
+                camera_poses.append(camera)
+            
+            if len(centers_2d) >= 2:
+                stroke.anchor_3d = self._compute_single_anchor(centers_2d, camera_poses)
+                print(f"计算 {stroke_id} 的3D anchor: {stroke.anchor_3d}")
+    
+    def _compute_single_anchor(self, centers_2d: List[np.ndarray], cameras: List[Camera]) -> np.ndarray:
+        """计算单个笔画的3D anchor点"""
+        anchor = np.zeros(3)
+        
+        for iteration in range(20):  # 最多迭代20次
+            projections = []
+            
+            for center_2d, camera in zip(centers_2d, cameras):
+                # 从2D点生成3D射线
+                ray_origin, ray_dir = self._ray_from_2d_point(center_2d, camera)
+                
+                # 将当前anchor投影到射线上
+                t = np.dot(anchor - ray_origin, ray_dir)
+                projection = ray_origin + t * ray_dir
+                projections.append(projection)
+            
+            new_anchor = np.mean(projections, axis=0)
+            
+            # 检查收敛
+            if np.linalg.norm(new_anchor - anchor) < 1e-6:
+                break
+                
+            anchor = new_anchor
+        
+        return anchor
+    
+    def _ray_from_2d_point(self, point_2d: np.ndarray, camera: Camera) -> Tuple[np.ndarray, np.ndarray]:
+        w2 = camera.image_width / 2.0
+        h2 = camera.image_height / 2.0
+        rel_x = point_2d[0] - w2
+        rel_y = point_2d[1] - h2
+        ray_origin = camera.position + rel_x * camera.right + rel_y * camera.up
+        ray_dir = camera.forward  # Direction toward anchor
+        return ray_origin, ray_dir
+    
+    def build_delaunay_triangulation(self):
+        """构建Delaunay三角剖分"""
+        if len(self.key_views) >= 3:
+            points = np.array(self.key_views)
+            self.delaunay = Delaunay(points)
+            print(f"构建Delaunay三角剖分，包含 {len(self.delaunay.simplices)} 个三角形")
+    
+    def generate_derived_views(self):
+        """生成衍生视角（围绕角色中心调整yaw和pitch）"""
+        new_views = []
+        group_anchor = next(iter(self.groups.values())).anchor_3d if self.groups else np.zeros(3)  # Use group anchor or origin
+
+        for yaw, pitch in self.key_views:
+            # 水平镜像 (yaw 反向)
+            if yaw != 0:
+                mirror_yaw = -yaw
+                if (mirror_yaw, pitch) not in self.key_views and (mirror_yaw, pitch) not in new_views:
+                    new_views.append((mirror_yaw, pitch))
+            
+            # 垂直镜像 (pitch 反向)
+            if pitch != 0:
+                mirror_pitch = -pitch
+                if (yaw, mirror_pitch) not in self.key_views and (yaw, mirror_pitch) not in new_views:
+                    new_views.append((yaw, mirror_pitch))
+
+        print(f"生成 {len(new_views)} 个衍生视角")
+
+        # 为每个衍生视角创建新相机并插值笔画
+        for new_yaw, new_pitch in new_views:
+            new_camera = Camera(new_yaw, new_pitch, self.image_width, self.image_height, group_anchor)
+            for stroke_id, stroke in self.strokes.items():
+                if (new_yaw, new_pitch) not in stroke.key_views and any(v in stroke.key_views for v in self.key_views):
+                    shape = self.interpolate_shape(stroke_id, new_camera)
+                    if shape is not None and len(shape) >= 2:
+                        stroke.key_views[(new_yaw, new_pitch)] = shape
+                        stroke.areas[(new_yaw, new_pitch)] = abs(_polygon_area(shape))
+
+        # 添加顶部/底部视角的横向旋转
+        for view in self.key_views[:]:
+            yaw, pitch = view
+            if abs(pitch) == math.pi / 2:
+                for new_yaw in np.linspace(-math.pi, math.pi, num=9, endpoint=False):
+                    if abs(new_yaw - yaw) > 1e-6 and (new_yaw, pitch) not in self.key_views:
+                        self.key_views.append((new_yaw, pitch))
+                        new_camera = Camera(new_yaw, pitch, self.image_width, self.image_height, group_anchor)
+                        for sid, stroke in self.strokes.items():
+                            if view in stroke.key_views:
+                                shape = self.interpolate_shape(sid, new_camera)
+                                if shape is not None and len(shape) >= 2:
+                                    stroke.key_views[(new_yaw, pitch)] = shape
+                                    stroke.areas[(new_yaw, pitch)] = abs(_polygon_area(shape))
+
+        self.build_delaunay_triangulation()
+    
+    def _find_closest_view(self, target_yaw: float, target_pitch: float) -> Tuple[float, float]:
+        """找到最近的已知视角"""
+        min_dist = float('inf')
+        closest_view = self.key_views[0] if self.key_views else (0, 0)
+        
+        for yaw, pitch in self.key_views:
+            dist = math.sqrt((yaw - target_yaw)**2 + (pitch - target_pitch)**2)
+            if dist < min_dist:
+                min_dist = dist
+                closest_view = (yaw, pitch)
+        
+        return closest_view
+    
+    def interpolate_shape(self, stroke_id: str, target_camera: Camera) -> Optional[np.ndarray]:
+        stroke = self.strokes[stroke_id]
+        target_view = (target_camera.yaw, target_camera.pitch)
+
+        if not self._is_visible(stroke, target_view):
+            return None
+
+        if target_view in stroke.key_views:
+            return stroke.key_views[target_view]
+
+        if self.delaunay is None or len(stroke.key_views) < 2:
+            return self._interpolate_nearest_edge(stroke, target_view)
+
+        target_point = np.array(target_view).reshape(1, -1)
+        simplex_idx = self.delaunay.find_simplex(target_point)
+        if simplex_idx[0] != -1:
+            triangle_indices = self.delaunay.simplices[simplex_idx[0]]  # Corrected from simplex[0] to simplex_idx[0]
+            triangle_views = [tuple(self.delaunay.points[i]) for i in triangle_indices]
+            available_map = {v: s for v, s in zip(triangle_views, [stroke.key_views.get(v) for v in triangle_views]) if s is not None}
+            available_views = list(available_map.keys())
+            available_shapes = list(available_map.values())
+            available_areas = [stroke.areas.get(v, 0.0) for v in available_views]
+
+            if len(available_views) < 2:
+                return self._interpolate_nearest_edge(stroke, target_view)
+
+            transform = self.delaunay.transform[simplex_idx[0]]
+            bary = transform[:2].dot(target_point[0] - transform[2])
+            bary = np.append(bary, 1 - bary.sum())  # [u, v, w]
+
+            weight_map = {triangle_views[i]: bary[i] for i in range(3)}
+            weights = np.array([weight_map[v] for v in available_views], dtype=float)
+            weights = weights / weights.sum()
+
+            min_points = min(len(shape) for shape in available_shapes)
+            aligned_shapes = [self._resample_path(shape, min_points) if len(shape) != min_points else shape for shape in available_shapes]
+
+            if len(available_shapes) >= 2:
+                interpolated = self._advanced_interpolate(aligned_shapes, weights)
+            else:
+                interpolated = sum(w * s for w, s in zip(weights, aligned_shapes))
+
+            area_targets = np.array([stroke.areas.get(v, 0.0) for v in available_views], dtype=float)
+            area_target = float(np.dot(weights, area_targets))
+            area_cur = abs(_polygon_area(interpolated))
+            if area_cur > 1e-8 and area_target > 1e-8:
+                scale = math.sqrt(area_target / area_cur)
+                c = np.mean(interpolated, axis=0, keepdims=True)
+                interpolated = (interpolated - c) * scale + c
+
+            return interpolated
+        else:
+            return self._interpolate_nearest_edge(stroke, target_view)
+    
+    def _interpolate_nearest_edge(self, stroke: Stroke, target_view: Tuple[float, float]) -> Optional[np.ndarray]:
+        """Project onto nearest triangle edge for interpolation."""
+        target_point = np.array(target_view)
+        min_dist = float('inf')
+        closest_t = None
+        closest_views = None
+
+        for simplex in self.delaunay.simplices:
+            verts = self.delaunay.points[simplex]
+            for i in range(3):
+                edge_start = verts[i]
+                edge_end = verts[(i + 1) % 3]
+                # Project target onto edge segment
+                vec = edge_end - edge_start
+                proj = np.dot(target_point - edge_start, vec) / np.dot(vec, vec)
+                proj = np.clip(proj, 0, 1)
+                proj_point = edge_start + proj * vec
+                dist = np.linalg.norm(target_point - proj_point)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_t = proj
+                    closest_views = (tuple(edge_start), tuple(edge_end))
+
+        if closest_views:
+            v1, v2 = closest_views
+            if v1 in stroke.key_views and v2 in stroke.key_views:
+                # Interp shapes with weight (1-t, t)
+                shape1 = stroke.key_views[v1]
+                shape2 = stroke.key_views[v2]
+                min_points = min(len(shape1), len(shape2))
+                shape1 = self._resample_path(shape1, min_points)
+                shape2 = self._resample_path(shape2, min_points)
+                interpolated = (1 - closest_t) * shape1 + closest_t * shape2
+                # Area scale (weighted)
+                area_target = (1 - closest_t) * stroke.areas.get(v1, 0) + closest_t * stroke.areas.get(v2, 0)
+                area_cur = abs(_polygon_area(interpolated))
+                if area_cur > 1e-8 and area_target > 0:
+                    scale = math.sqrt(area_target / area_cur)
+                    c = np.mean(interpolated, axis=0, keepdims=True)
+                    interpolated = (interpolated - c) * scale + c
+                return interpolated
+        return None
+    
+    # New: Advanced shape interp using Sederberg + Alexa
+    def _advanced_interpolate(self, shapes: List[np.ndarray], weights: np.ndarray) -> np.ndarray:
+        """Advanced: Sederberg for correspondence + Alexa for ARAP paths."""
+        # For simplicity, pairwise for 2-3 shapes; extend for more
+        if len(shapes) == 2:
+            shape1, shape2 = shapes
+            w1, w2 = weights
+            # Sederberg: Find correspondence
+            corr = self._sederberg_correspondence(shape1, shape2)
+            # Resample to match corr
+            aligned1, aligned2 = self._align_to_correspondence(shape1, shape2, corr)
+            # Alexa: Triangulate and ARAP
+            interpolated = self._arap_interpolate(aligned1, aligned2, w2)  # t = w2
+            return interpolated
+        # For 3: Barycentric, pairwise or generalized (simplify to linear for now)
+        return sum(w * s for w, s in zip(weights, shapes))  # Fallback
+
+    def _sederberg_correspondence(self, poly1: np.ndarray, poly2: np.ndarray) -> List[Tuple[int, int]]:
+        """Sederberg DP for vertex correspondence (min work)."""
+        m, n = len(poly1), len(poly2)
+        # Parameters from paper (defaults; can tune)
+        k_s = 1.0  # Stretching stiffness
+        e_s = 1.0  # Stretching exponent
+        c_s = 0.5  # Compression penalty
+        k_b = 1.0  # Bending stiffness
+        e_b = 1.0  # Bending exponent
+        m_b = 1.0  # Non-monotonic penalty
+        p_b = 10.0  # Zero-angle penalty
+
+        # Cost matrix
+        cost = np.full((m + 1, n + 1), float('inf'))
+        cost[0, 0] = 0
+        backtrack = np.full((m + 1, n + 1, 2), -1, dtype=int)  # Store previous (i,j)
+
+        for i in range(m + 1):
+            for j in range(n + 1):
+                if i == 0 and j == 0:
+                    continue
+                
+                # East: Insert in poly1 (move right, skip i)
+                if i > 0:
+                    # Stretching for insertion (paper approximates as penalty on length)
+                    insert_cost = k_s * np.linalg.norm(poly1[i-1]) ** e_s
+                    new_cost = cost[i-1, j] + insert_cost
+                    if new_cost < cost[i, j]:
+                        cost[i, j] = new_cost
+                        backtrack[i, j] = [i-1, j]
+                
+                # South: Insert in poly2 (move down, skip j)
+                if j > 0:
+                    insert_cost = k_s * np.linalg.norm(poly2[j-1]) ** e_s
+                    new_cost = cost[i, j-1] + insert_cost
+                    if new_cost < cost[i, j]:
+                        cost[i, j] = new_cost
+                        backtrack[i, j] = [i, j-1]
+                
+                # Southeast: Match vertices
+                if i > 0 and j > 0:
+                    # Stretching cost for edge [i-1 to i] -> [j-1 to j] (but since single vertex match, approximate)
+                    L0 = np.linalg.norm(poly1[i-1]) if i==1 else np.linalg.norm(poly1[i-2] - poly1[i-1])  # Prev edge
+                    L1 = np.linalg.norm(poly2[j-1]) if j==1 else np.linalg.norm(poly2[j-2] - poly2[j-1])
+                    stretch = k_s * abs(L1 - L0) ** e_s * ((1 - c_s) * min(L0, L1) + c_s * max(L0, L1))
+                    
+                    # Bending (needs three points; approximate with angle at vertex)
+                    if i > 1 and j > 1:
+                        vec1_prev = poly1[i-2] - poly1[i-1]
+                        vec1_curr = poly1[i-1] - poly1[i]
+                        theta0 = np.arccos(np.dot(vec1_prev, vec1_curr) / (np.linalg.norm(vec1_prev) * np.linalg.norm(vec1_curr)))
+                        
+                        vec2_prev = poly2[j-2] - poly2[j-1]
+                        vec2_curr = poly2[j-1] - poly2[j]
+                        theta1 = np.arccos(np.dot(vec2_prev, vec2_curr) / (np.linalg.norm(vec2_prev) * np.linalg.norm(vec2_curr)))
+                        
+                        d_theta = abs(theta1 - theta0)
+                        d_theta_star = 0  # Simplify, compute non-monotonic if needed
+                        if theta0 == 0 or theta1 == 0:
+                            bend = k_b * (d_theta + m_b * d_theta_star) ** e_b + p_b
+                        else:
+                            bend = k_b * (d_theta + m_b * d_theta_star) ** e_b
+                    else:
+                        bend = 0
+                    
+                    new_cost = cost[i-1, j-1] + stretch + bend
+                    if new_cost < cost[i, j]:
+                        cost[i, j] = new_cost
+                        backtrack[i, j] = [i-1, j-1]
+
+        # Backtrack path
+        corr = []
+        i, j = m, n
+        while i > 0 or j > 0:
+            prev = backtrack[i, j]
+            if prev[0] == i-1 and prev[1] == j-1:
+                corr.append((i-1, j-1))
+            # Else insertion, no corr addition
+            i, j = prev
+        return corr[::-1]
+
+    def _stretching_cost(self, p1: np.ndarray, p2: np.ndarray) -> float:
+        """Approx stretching (length diff)."""
+        return abs(np.linalg.norm(p1) - np.linalg.norm(p2))  # Simplify; use paper eq
+
+    def _insertion_cost(self, p: np.ndarray) -> float:
+        return np.linalg.norm(p) * 0.5  # Penalty
+
+    def _align_to_correspondence(self, poly1: np.ndarray, poly2: np.ndarray, corr: List[Tuple[int, int]]) -> Tuple[np.ndarray, np.ndarray]:
+        """Resample to match corr."""
+        # Compute cumulative lengths for poly1 and poly2
+        len1 = np.cumsum(np.linalg.norm(np.diff(poly1, axis=0), axis=1))
+        len1 = np.insert(len1, 0, 0)
+        len2 = np.cumsum(np.linalg.norm(np.diff(poly2, axis=0), axis=1))
+        len2 = np.insert(len2, 0, 0)
+        
+        # Normalize
+        len1 /= len1[-1]
+        len2 /= len2[-1]
+        
+        # For each matched pair in corr, map parameters
+        # To resample, create new point set with matched segments
+        aligned1 = []
+        aligned2 = []
+        prev_i, prev_j = 0, 0
+        for i, j in corr:
+            # Add points from prev to current, resampled to common num
+            seg1 = poly1[prev_i:i+1]
+            seg2 = poly2[prev_j:j+1]
+            num_pts = max(len(seg1), len(seg2))  # Or fixed
+            aligned1.append(self._resample_path(seg1, num_pts))
+            aligned2.append(self._resample_path(seg2, num_pts))
+            prev_i, prev_j = i, j
+        
+        # Concatenate
+        aligned1 = np.vstack(aligned1) if aligned1 else poly1
+        aligned2 = np.vstack(aligned2) if aligned2 else poly2
+        return aligned1, aligned2
+
+    def _arap_interpolate(self, poly1: np.ndarray, poly2: np.ndarray, t: float) -> np.ndarray:
+        """Alexa ARAP for 2D polygons."""
+        # Assume closed polygons; append first point if not
+        if not np.allclose(poly1[0], poly1[-1]):
+            poly1 = np.vstack([poly1, poly1[0]])
+            poly2 = np.vstack([poly2, poly2[0]])
+        
+        # Triangulate poly1 (assume convex or use Delaunay)
+        tri = Delaunay(poly1[:-1])  # Exclude duplicate last point
+        triangles = tri.simplices
+        
+        # Vertices: assume poly1 and poly2 have same order (from correspondence)
+        V0 = poly1[:-1]  # Source
+        V1 = poly2[:-1]  # Target
+        n = len(V0)
+        
+        # Iterate until convergence (paper uses a few iterations)
+        Vt = (1 - t) * V0 + t * V1  # Initial linear guess
+        for iter in range(10):  # Max iterations
+            # Compute rotations R_i for each triangle
+            R = []  # List of rotations per triangle
+            for idx in triangles:
+                # Source triangle
+                P = V0[idx]
+                # Current estimate triangle
+                Q = Vt[idx]
+                # Centered
+                P_c = P - np.mean(P, axis=0)
+                Q_c = Q - np.mean(Q, axis=0)
+                # Covariance matrix
+                C = Q_c.T @ P_c
+                # SVD
+                U, S, Vh = np.linalg.svd(C)
+                Ri = U @ Vh
+                # Fix reflection if det < 0
+                if np.linalg.det(Ri) < 0:
+                    U[:, -1] = -U[:, -1]
+                    Ri = U @ Vh
+                R.append(Ri)
+            
+            # Build linear system for Vt
+            # For each vertex v_i, sum over incident triangles
+            # A Vt = b
+            A = np.zeros((2*n, 2*n))  # Sparse, but dense for small n
+            b = np.zeros((2*n, 1))
+            for tri_idx, idx in enumerate(triangles):
+                Ri = R[tri_idx]
+                for j in range(3):  # For each vertex in triangle
+                    vj = idx[j]
+                    # Weights w=1 for simplicity (paper uses 1)
+                    w = 1.0
+                    A[2*vj:2*vj+2, 2*vj:2*vj+2] += w * np.eye(2)
+                    # For neighbors
+                    for k in range(3):
+                        if j == k: continue
+                        vk = idx[k]
+                        e_jk_0 = V0[vk] - V0[vj]  # Source edge
+                        A[2*vj:2*vj+2, 2*vk:2*vk+2] -= (w / 2) * Ri
+                        A[2*vj:2*vj+2, 2*vj:2*vj+2] += (w / 2) * Ri
+                        e_jk_1 = V1[vk] - V1[vj]  # Target edge
+                        b[2*vj:2*vj+2] += (w / 2) * Ri @ ((1 - t) * e_jk_0 + t * e_jk_1)
+            
+            # Solve A x = b (flatten Vt)
+            x = np.linalg.solve(A, b.flatten())
+            Vt_new = x.reshape(n, 2)
+            
+            # Check convergence
+            if np.linalg.norm(Vt_new - Vt) < 1e-6:
+                break
+            Vt = Vt_new
+        
+        return Vt  # Return without closing point
+
+    def _is_visible(self, stroke: Stroke, target_view: Tuple[float, float]) -> bool:
+        """Check if target (yaw,pitch) inside any visibility polygon."""
+        for poly in stroke.visibility_regions:
+            if len(poly) < 3:
+                continue
+            path = mpath.Path(np.array(poly))
+            if path.contains_point(target_view):
+                return True
+        return True  # Default visible if no regions
+
+    def render_novel_view(self, target_camera: Camera) -> Dict[str, np.ndarray]:
+        """渲染新视角：若命中已知关键视角，直接返回该形状（不做anchor平移）；否则按anchor+插值"""
+        stroke_list = []
+        target_view = (target_camera.yaw, target_camera.pitch)
+        order = self.view_orders.get(target_view, [])  # Default to empty list if not found
+
+        for stroke_id, stroke in self.strokes.items():
+            try:
+                if not self._is_visible(stroke, target_view):
+                    continue
+
+                if target_view in stroke.key_views:
+                    shape = stroke.key_views[target_view]
+                else:
+                    shape = self.interpolate_shape(stroke_id, target_camera)
+                    if shape is None or len(shape) < 2:  # Skip invalid shapes
+                        continue
+                    if stroke.has_anchor and stroke.anchor_3d is not None:
+                        pos_2d = self._project_3d_to_2d(stroke.anchor_3d, target_camera)
+                        if pos_2d is None:
+                            continue
+                        shape_center = np.mean(shape, axis=0)
+                        shape = shape - shape_center + pos_2d
+
+                order_index = order.index(stroke_id) if stroke_id in order else len(order)
+                stroke_list.append((stroke_id, shape, order_index))
+
+            except Exception as e:
+                print(f"渲染笔画 {stroke_id} 时出错: {e}")
+                continue
+
+        stroke_list.sort(key=lambda x: x[2], reverse=True)  # Reverse for bottom-to-top layering
+        ordered_rendered = {sid: shape for sid, shape, _ in stroke_list}
+        return ordered_rendered
+    
+    def _project_3d_to_2d(self, point_3d: np.ndarray, camera: Camera) -> Optional[np.ndarray]:
+        direction = point_3d - camera.position
+        x_2d = np.dot(direction, camera.right)
+        y_2d = np.dot(direction, camera.up)
+        x_image = x_2d + camera.image_width / 2
+        y_image = -y_2d + camera.image_height / 2  # Invert Y for SVG
+        return np.array([x_image, y_image])
+    
+    def create_group(self, group_id: str, stroke_ids: List[str]):
+        """创建笔画组"""
+        group = StrokeGroup(group_id)
+        
+        for stroke_id in stroke_ids:
+            if stroke_id in self.strokes:
+                stroke = self.strokes[stroke_id]
+                stroke.group_id = group_id
+                group.strokes.append(stroke)
+        
+        # 计算组anchor点
+        anchors = []
+        for stroke in group.strokes:
+            if stroke.anchor_3d is not None:
+                anchors.append(stroke.anchor_3d)
+        
+        if anchors:
+            group.anchor_3d = np.mean(anchors, axis=0)
+            print(f"创建组 {group_id}，anchor点: {group.anchor_3d}")
+        
+        self.groups[group_id] = group
+
+def parse_svg_file(svg_file: str) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, str]], List[str]]:
+    """解析SVG文件，提取每个 <path>, <ellipse>, <circle> 作为单独的笔画，并保留样式和原始顺序"""
+    try:
+        tree = ET.parse(svg_file)
+        root = tree.getroot()
+
+        ns = {'svg': 'http://www.w3.org/2000/svg'}
+        if '}' in root.tag:
+            ns_prefix = root.tag.split('}')[0][1:]
+            ns = {'svg': ns_prefix}
+
+        strokes: Dict[str, np.ndarray] = {}
+        styles: Dict[str, Dict[str, str]] = {}
+        order: List[str] = []  # Store the order of stroke IDs as they appear
+
+        def _get_style(elem, parent_default=None):
+            style = {'fill': 'none', 'stroke': '#000000', 'stroke-width': '1'}
+            if parent_default:
+                style.update({k: v for k, v in parent_default.items() if v is not None})
+            inline = elem.get('style')
+            if inline:
+                parts = [p.strip() for p in inline.split(';') if p.strip()]
+                for p in parts:
+                    if ':' in p:
+                        k, v = p.split(':', 1)
+                        style[k.strip()] = v.strip()
+            for k in ['fill', 'stroke', 'stroke-width']:
+                v = elem.get(k)
+                if v is not None and v != '':
+                    style[k] = v
+            return style
+
+        def _sample_path(d: str, samples_per_seg: int = 32) -> List[List[float]]:
+            pts = []
+            parsed = parse_path(d) if d else None
+            if parsed:
+                for seg in parsed:
+                    for t in np.linspace(0.0, 1.0, samples_per_seg, endpoint=True):
+                        z = seg.point(t)
+                        pts.append([z.real, z.imag])
+            return pts
+
+        # Process each shape individually, preserving order from <g> elements
+        for g in root.findall('.//svg:g', ns) or root.findall('.//g'):
+            g_id = g.get('id')
+            if not g_id:
+                continue
+            
+            # Process all shapes within this group
+            for elem in g.findall('.//svg:path', ns) or g.findall('.//path'):
+                stroke_id = elem.get('id', f"{g_id}_path_{len(strokes)}")
+                if not stroke_id:
+                    continue
+                d = elem.get('d', '')
+                points = _sample_path(d)
+                if points:
+                    strokes[stroke_id] = np.array(points, dtype=float)
+                    styles[stroke_id] = _get_style(elem)
+                    if g_id not in order:  # Add group ID to order if not already present
+                        order.append(g_id)
+
+            for elem in g.findall('.//svg:ellipse', ns) or g.findall('.//ellipse'):
+                stroke_id = elem.get('id', f"{g_id}_ellipse_{len(strokes)}")
+                if not stroke_id:
+                    continue
+                try:
+                    cx = float(elem.get('cx', 0))
+                    cy = float(elem.get('cy', 0))
+                    rx = float(elem.get('rx', 0))
+                    ry = float(elem.get('ry', 0))
+                    points = []
+                    for angle in np.linspace(0, 2*np.pi, 64, endpoint=True):
+                        x = cx + rx * np.cos(angle)
+                        y = cy + ry * np.sin(angle)
+                        points.append([x, y])
+                    strokes[stroke_id] = np.array(points, dtype=float)
+                    styles[stroke_id] = _get_style(elem)
+                    if g_id not in order:
+                        order.append(g_id)
+                except ValueError:
+                    continue
+
+            for elem in g.findall('.//svg:circle', ns) or g.findall('.//circle'):
+                stroke_id = elem.get('id', f"{g_id}_circle_{len(strokes)}")
+                if not stroke_id:
+                    continue
+                try:
+                    cx = float(elem.get('cx', 0))
+                    cy = float(elem.get('cy', 0))
+                    r = float(elem.get('r', 0))
+                    points = []
+                    for angle in np.linspace(0, 2*np.pi, 64, endpoint=True):
+                        x = cx + r * np.cos(angle)
+                        y = cy + r * np.sin(angle)
+                        points.append([x, y])
+                    strokes[stroke_id] = np.array(points, dtype=float)
+                    styles[stroke_id] = _get_style(elem)
+                    if g_id not in order:
+                        order.append(g_id)
+                except ValueError:
+                    continue
+
+        print(f"Parsed {len(strokes)} strokes from {svg_file} with order {order}")
+        return strokes, styles, order
+
+    except ET.ParseError as e:
+        print(f"XML解析错误: {e}")
+        return {}, {}, []
+    except Exception as e:
+        print(f"解析SVG文件错误: {e}")
+        return {}, {}, []
+
+def export_svg(strokes: Dict[str, np.ndarray],
+               styles: Dict[str, Dict[str, str]],
+               width: int,
+               height: int,
+               filename: str):
+    """把渲染结果导出为SVG；每个stroke输出为一个<g><path .../></g>"""
+    def _path_d(points: np.ndarray, close_path: bool = True) -> str:
+        if len(points) == 0:
+            return ""
+        cmds = [f"M {points[0,0]:.3f},{points[0,1]:.3f}"]
+        for i in range(1, len(points)):
+            cmds.append(f"L {points[i,0]:.3f},{points[i,1]:.3f}")
+        if close_path:
+            cmds.append("Z")
+        return " ".join(cmds)
+
+    root = ET.Element("svg", attrib={
+        "xmlns": "http://www.w3.org/2000/svg",
+        "width": str(width),
+        "height": str(height),
+        "viewBox": f"0 0 {width} {height}"
+    })
+
+    for sid, pts in strokes.items():
+        g = ET.SubElement(root, "g", attrib={"id": sid})
+        style = styles.get(sid, {})
+        path_attr = {
+            "d": _path_d(pts),
+            "fill": style.get("fill", "none"),
+            "stroke": style.get("stroke", "#000"),
+            "stroke-width": style.get("stroke-width", "1")
+        }
+        ET.SubElement(g, "path", attrib=path_attr)
+
+    tree = ET.ElementTree(root)
+    try:
+        ET.indent(tree, space="  ", level=0)  # Python 3.9+
+    except AttributeError:
+        # Python < 3.9 没有 indent，就忽略缩进
+        pass
+
+    tree.write(filename, encoding="utf-8", xml_declaration=True)
+    print(f"SVG 已导出：{filename}")
+
+def visualize_strokes(strokes: Dict[str, np.ndarray], output_file: str = None):
+    """可视化笔画"""
+    if not strokes:
+        print("没有笔画可可视化")
+        return
+        
+    fig, ax = plt.subplots(figsize=(12, 12))
+    
+    colors = plt.cm.tab10.colors
+    color_idx = 0
+    
+    for stroke_id, points in strokes.items():
+        if len(points) > 1:
+            # 创建路径
+            path = Path(points)
+            patch = patches.PathPatch(path, facecolor='none', 
+                                    edgecolor=colors[color_idx % len(colors)], 
+                                    lw=2, label=stroke_id)
+            ax.add_patch(patch)
+            color_idx += 1
+            
+            # 添加中心点
+            center = np.mean(points, axis=0)
+            ax.plot(center[0], center[1], 'ro', markersize=5)
+    
+    ax.set_xlim(0, 210)
+    ax.set_ylim(0, 297)
+    ax.set_aspect('equal')
+    ax.invert_yaxis()  # SVG坐标系Y轴向下
+    ax.legend()
+    ax.set_title('2.5D Cartoon Model - Novel View')
+    
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"图像已保存到: {output_file}")
+    else:
+        plt.show()
+    
+    plt.close()
+
+def visualize_all_views(model: CartoonModel2_5D, output_dir: str = "view_visualizations"):
+    """Visualize all key views (original + derived) and save as images."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for idx, (yaw, pitch) in enumerate(model.key_views):
+        view_strokes = {}
+        for stroke_id, stroke in model.strokes.items():
+            if (yaw, pitch) in stroke.key_views:
+                view_strokes[stroke_id] = stroke.key_views[(yaw, pitch)]
+        
+        if view_strokes:
+            filename = os.path.join(output_dir, f"view_yaw{pitch:.1f}_pitch{yaw:.1f}.png")
+            visualize_strokes(view_strokes, filename)
+            print(f"Visualized view (yaw={yaw:.1f}, pitch={pitch:.1f}) to {filename}")
+
+def main():
+    # 创建2.5D模型
+    model = CartoonModel2_5D(image_width=210, image_height=297)
+    
+    # 定义关键视角 (基于角色中心)
+    front_camera = Camera(yaw=0, pitch=0)
+    top_camera = Camera(yaw=0, pitch=math.pi / 2)  # 90° downward
+    right_camera = Camera(yaw=-math.pi / 2, pitch=0)  # Counterclockwise 90°
+
+    # 解析SVG文件
+    front_strokes, front_styles, front_order = parse_svg_file('data/yellow_head_front.svg')
+    top_strokes, top_styles, top_order = parse_svg_file('data/yellow_head_top.svg')
+    right_strokes, right_styles, right_order = parse_svg_file('data/yellow_head_right.svg')
+    
+    print(f"正面视图解析到 {len(front_strokes)} 个笔画 with order {front_order}")
+    print(f"顶视图解析到 {len(top_strokes)} 个笔画 with order {top_order}")
+    print(f"右视图解析到 {len(right_strokes)} 个笔画 with order {right_order}")
+    
+    # 添加关键视角
+    model.add_key_view(front_camera, front_strokes, front_styles, front_order)
+    model.add_key_view(top_camera, top_strokes, top_styles, top_order)
+    model.add_key_view(right_camera, right_strokes, right_styles, right_order)
+
+    model.center_views()
+
+    # 计算3D anchor点
+    model.compute_3d_anchors()
+    
+    # 构建Delaunay三角剖分
+    model.build_delaunay_triangulation()
+    
+    # 生成衍生视角（镜像对称）
+    model.generate_derived_views()
+    
+    print(f"总共 {len(model.key_views)} 个视角")
+    
+    # 可视化所有视角
+    visualize_all_views(model)
+    
+    # 创建组（例如眼睛组）
+    model.create_group('eyes', ['rightEye', 'leftEye'])
+    for group in model.groups.values():
+        for stroke in group.strokes:
+            stroke.anchor_3d = group.anchor_3d  # Override with group mean
+    
+    # 渲染新视角
+    novel_camera = Camera(yaw=30, pitch=45)
+    rendered = model.render_novel_view(novel_camera)
+    
+    merged_styles = {}
+    for d in [right_styles, top_styles, front_styles]:
+        merged_styles.update(d)
+
+    # 导出SVG with original order
+    export_svg(rendered, merged_styles, model.image_width, model.image_height, "novel_view.svg")
+    
+    print("2.5D卡通模型创建成功！")
+    print(f"渲染了 {len(rendered)} 个笔画")
+
+if __name__ == "__main__":
+    main()
