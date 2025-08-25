@@ -56,6 +56,7 @@ class Stroke:
         self.styles: Dict[str, str] = {}     # e.g., {'fill': '#ffcc00', 'stroke': '#000', 'stroke-width': '1'}
         self.areas: Dict[Tuple[float, float], float] = {}  # 记录每个视角下的多边形面积
         self.visibility_regions: List[List[Tuple[float, float]]] = []  # e.g., [[(yaw1,pitch1), (yaw2,pitch2), ...]]
+        self.relative_offset: Optional[np.ndarray] = None
 
 def _polygon_area(points: np.ndarray) -> float:
     if points is None or len(points) < 3:
@@ -614,19 +615,17 @@ class CartoonModel2_5D:
                 self.strokes[stroke_id].styles = styles.get(stroke_id, {})
 
     def render_novel_view(self, target_camera: Camera) -> Dict[str, np.ndarray]:
-        """渲染新视角：若命中已知关键视角，直接返回该形状；否则按anchor+插值 with global rotation and 3D depth sorting"""
+        """渲染新视角：若命中已知关键视角，直接返回该形状；否则按anchor+插值 with global rotation and Z-ordering"""
         stroke_list = []
         target_view = (target_camera.yaw, target_camera.pitch)
-        group_anchor = next(iter(self.groups.values())).anchor_3d if self.groups else self.default_group_anchor
+        # Use head group anchor if exists, otherwise default
+        group_anchor = self.groups.get('head', self.groups.get(next(iter(self.groups), None) or {'anchor_3d': self.default_group_anchor})).anchor_3d
+        print(f"Rendering with group_anchor: {group_anchor}")
 
-        # Apply global rotation
+        # Apply global rotation to head group anchor
         rotation_matrix = self._get_rotation_matrix(group_anchor, target_camera.yaw, target_camera.pitch)
-        rotated_anchors = {}
-        for stroke_id, stroke in self.strokes.items():
-            if stroke.anchor_3d is not None:
-                anchor_4d = np.append(stroke.anchor_3d, 1)
-                rotated_anchor_4d = rotation_matrix @ anchor_4d
-                rotated_anchors[stroke_id] = rotated_anchor_4d[:3]
+        rotated_group_anchor_4d = rotation_matrix @ np.append(group_anchor, 1)
+        rotated_group_anchor = rotated_group_anchor_4d[:3]
 
         # Get the base order for this view or the first available view
         base_order = self.view_orders.get(target_view)
@@ -644,24 +643,46 @@ class CartoonModel2_5D:
                     shape = self.interpolate_shape(stroke_id, target_camera)
                     if shape is None or len(shape) < 2:
                         continue
-                    if stroke.has_anchor and stroke.anchor_3d is not None:
-                        pos_2d = self._project_3d_to_2d(rotated_anchors.get(stroke_id, stroke.anchor_3d), target_camera)
-                        if pos_2d is None:
-                            continue
+                    # Use hierarchical group-relative positioning
+                    if stroke.group_id:
+                        current_group = self.groups.get(stroke.group_id)
+                        if current_group and current_group.anchor_3d is not None and stroke.relative_offset is not None:
+                            # Traverse up to head group for global rotation
+                            group_anchor_to_use = current_group.anchor_3d
+                            while current_group.group_id and current_group.group_id in self.groups:
+                                parent_group = self.groups[current_group.group_id]
+                                group_anchor_to_use = parent_group.anchor_3d
+                                current_group = parent_group
+                            rotated_anchor = rotated_group_anchor + stroke.relative_offset
+                            print(f"Stroke {stroke_id} rotated_anchor: {rotated_anchor}")
+                            pos_2d = self._project_3d_to_2d(rotated_anchor, target_camera)
+                        else:
+                            pos_2d = None
+                    elif stroke.anchor_3d is not None:
+                        anchor_4d = np.append(stroke.anchor_3d, 1)
+                        rotated_anchor_4d = rotation_matrix @ anchor_4d
+                        pos_2d = self._project_3d_to_2d(rotated_anchor_4d[:3], target_camera)
+                    else:
+                        pos_2d = None
+                    if pos_2d is not None:
                         shape_center = np.mean(shape, axis=0)
                         shape = shape - shape_center + pos_2d
 
-                # Use 3D depth for Z-ordering, fallback to original order index
-                depth = -np.dot(rotated_anchors.get(stroke_id, stroke.anchor_3d) - target_camera.position, target_camera.forward) if stroke.anchor_3d is not None else float('inf')
-                order_index = base_order.index(stroke_id) if base_order and stroke_id in base_order else len(base_order or [])
+                # Determine Z-order: prioritize SVG order, use depth for novel views with valid anchors
+                if base_order and stroke_id in base_order:
+                    order_index = base_order.index(stroke_id)  # Lower index = lower layer
+                else:
+                    order_index = len(base_order or [])  # Default to end if not in order
+                depth = -np.dot(rotated_anchor - target_camera.position, target_camera.forward) if 'rotated_anchor' in locals() and rotated_anchor is not None and target_view not in self.key_views else order_index * float('inf')
+
                 stroke_list.append((stroke_id, shape, depth, order_index))
 
             except Exception as e:
                 print(f"渲染笔画 {stroke_id} 时出错: {e}")
                 continue
 
-        # Sort by depth (farther to closer) and then by original order
-        stroke_list.sort(key=lambda x: (x[2], x[3]))  # Primary: depth, Secondary: order index
+        # Sort primarily by original SVG order (order_index, ascending = bottom to top), then by depth for novel views
+        stroke_list.sort(key=lambda x: (x[3], x[2] if target_view not in self.key_views else 0))
         ordered_rendered = {sid: shape for sid, shape, _, _ in stroke_list}
         return ordered_rendered
     
@@ -705,8 +726,8 @@ class CartoonModel2_5D:
         y_image = y_2d + camera.image_height / 2  # Invert Y for SVG
         return np.array([x_image, y_image])
     
-    def create_group(self, group_id: str, stroke_ids: List[str]):
-        """创建笔画组"""
+    def create_group(self, group_id: str, stroke_ids: List[str], parent_group_id: Optional[str] = None):
+        """创建笔画组 with relative offsets, optionally under a parent group"""
         group = StrokeGroup(group_id)
         
         for stroke_id in stroke_ids:
@@ -723,8 +744,21 @@ class CartoonModel2_5D:
         if anchors:
             group.anchor_3d = np.mean(anchors, axis=0)
             print(f"创建组 {group_id}，anchor点: {group.anchor_3d}")
+            # Store relative offsets for all strokes in the group
+            for stroke in group.strokes:
+                if stroke.anchor_3d is not None:
+                    if stroke.relative_offset is None:
+                        stroke.relative_offset = stroke.anchor_3d - group.anchor_3d
+                    else:
+                        stroke.relative_offset = stroke.anchor_3d - group.anchor_3d  # Update if already set
+                else:
+                    stroke.relative_offset = np.zeros(3)
+        else:
+            group.anchor_3d = np.zeros(3)  # Default anchor if no valid anchors
         
         self.groups[group_id] = group
+        if parent_group_id and parent_group_id in self.groups:
+            self.groups[parent_group_id].strokes.append(group)  # Hierarchical linking
 
 def parse_svg_file(svg_file: str) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, str]], List[str]]:
     try:
@@ -966,14 +1000,23 @@ def main():
     # 可视化所有视角
     # visualize_all_views(model)
     
-    # 创建组（例如眼睛组） before rendering novel view
-    model.create_group('eyes', ['rightEye', 'leftEye'])
+    # 创建组（分层绑定所有身体部分）
+    model.create_group('eyes', ['rightEye', 'leftEye'])  # Eyes subgroup
+    model.create_group('earsFace', ['rightEar', 'leftEar', 'face'], 'head')  # Ears and face group under head
+    model.create_group('head', ['eyes', 'earsFace', 'nose', 'mouth'])  # Top-level head group
     for group in model.groups.values():
-        for stroke in group.strokes:
-            stroke.anchor_3d = group.anchor_3d  # Override with group mean
-    
+        for stroke_or_subgroup in group.strokes:
+            if isinstance(stroke_or_subgroup, Stroke):  # Handle individual strokes
+                if stroke_or_subgroup.anchor_3d is None or group.anchor_3d is not None:
+                    stroke_or_subgroup.anchor_3d = group.anchor_3d  # Override with group mean
+            else:  # Handle subgroups (e.g., 'eyes', 'earsFace')
+                for stroke in model.strokes.values():
+                    if stroke.group_id == stroke_or_subgroup.id:
+                        if stroke.anchor_3d is None or group.anchor_3d is not None:
+                            stroke.anchor_3d = group.anchor_3d
+
     # 渲染新视角
-    novel_camera = Camera(yaw=-30, pitch=0)
+    novel_camera = Camera(yaw=0, pitch=60)  # Test with front view
     rendered = model.render_novel_view(novel_camera)
     
     merged_styles = {}
