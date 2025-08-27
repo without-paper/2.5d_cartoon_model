@@ -50,13 +50,16 @@ class Camera:
 class Stroke:
     def __init__(self, stroke_id: str):
         self.id = stroke_id
-        self.key_views: Dict[Tuple[float, float], np.ndarray] = {}
+        self.key_views: Dict[Tuple[float, float], np.ndarray] = {}  # Original points
+        self.normalized_shapes: Dict[Tuple[float, float], np.ndarray] = {}  # Points relative to centroid
+        self.centroids: Dict[Tuple[float, float], np.ndarray] = {}  # Centroid per view
+        self.radii: Dict[Tuple[float, float], float] = {}  # Radius for circular strokes (e.g., face)
         self.anchor_3d: Optional[np.ndarray] = None
         self.has_anchor = True
         self.group_id: Optional[str] = None
-        self.styles: Dict[str, str] = {}  # e.g., {'fill': '#ffcc00', 'stroke': '#000', 'stroke-width': '1'}
-        self.areas: Dict[Tuple[float, float], float] = {}  # Polygon area per view
-        self.visibility_regions: List[List[Tuple[float, float]]] = []  # e.g., [[(yaw1,pitch1), (yaw2,pitch2), ...]]
+        self.styles: Dict[str, str] = {}
+        self.areas: Dict[Tuple[float, float], float] = {}
+        self.visibility_regions: List[List[Tuple[float, float]]] = []
         self.relative_offset: Optional[np.ndarray] = None
 
 def _polygon_area(points: np.ndarray) -> float:
@@ -97,13 +100,21 @@ class CartoonModel2_5D:
             if stroke_id not in self.strokes:
                 self.strokes[stroke_id] = Stroke(stroke_id)
             resampled_points = self._resample_path(path_points, 100)
+            centroid = np.mean(resampled_points, axis=0) if len(resampled_points) > 0 else np.array([self.image_width/2, self.image_height/2])
+            normalized_shape = resampled_points - centroid if len(resampled_points) > 0 else resampled_points
             self.strokes[stroke_id].key_views[view_key] = resampled_points
+            self.strokes[stroke_id].normalized_shapes[view_key] = normalized_shape
+            self.strokes[stroke_id].centroids[view_key] = centroid
             self.strokes[stroke_id].areas[view_key] = abs(_polygon_area(resampled_points))
+            # Estimate radius for circular strokes (e.g., face)
+            if stroke_id == 'face' and len(resampled_points) > 0:
+                distances = np.linalg.norm(resampled_points - centroid, axis=1)
+                self.strokes[stroke_id].radii[view_key] = np.mean(distances)
             if styles and not self.strokes[stroke_id].styles:
                 self.strokes[stroke_id].styles = styles.get(stroke_id, {})
 
     def center_views(self):
-        """Align centroids across all views to image center."""
+        """Align global centroids across all views to image center."""
         global_centroids = {}
         for view in self.key_views:
             view_points = []
@@ -120,7 +131,12 @@ class CartoonModel2_5D:
                 for stroke in self.strokes.values():
                     if view in stroke.key_views:
                         stroke.key_views[view] += shift
+                        stroke.centroids[view] += shift
+                        stroke.normalized_shapes[view] = stroke.key_views[view] - stroke.centroids[view]
                         stroke.areas[view] = abs(_polygon_area(stroke.key_views[view]))
+                        if view in stroke.radii:
+                            # Radius remains unchanged as it's relative to centroid
+                            pass
 
     def _resample_path(self, points: np.ndarray, num_points: int) -> np.ndarray:
         """Resample path to fixed number of points."""
@@ -146,9 +162,8 @@ class CartoonModel2_5D:
                 continue
             centers_2d = []
             camera_poses = []
-            for (yaw, pitch), path_points in stroke.key_views.items():
-                center_2d = np.mean(path_points, axis=0)
-                centers_2d.append(center_2d)
+            for (yaw, pitch), centroid in stroke.centroids.items():
+                centers_2d.append(centroid)
                 camera = Camera(yaw, pitch, self.image_width, self.image_height)
                 camera_poses.append(camera)
             if len(centers_2d) >= 2:
@@ -232,8 +247,8 @@ class CartoonModel2_5D:
         return closest_view
 
     def _is_visible(self, stroke: Stroke, target_view: Tuple[float, float]) -> bool:
-        """Check if stroke is visible in target view (placeholder, assumes always visible)."""
-        return True  # Simplified for now; add visibility regions logic if needed
+        """Check if stroke is visible in target view (placeholder)."""
+        return True
 
     def _advanced_interpolate(self, shapes: List[np.ndarray], weights: np.ndarray) -> np.ndarray:
         """Perform weighted interpolation of shapes (assumes aligned points)."""
@@ -243,55 +258,169 @@ class CartoonModel2_5D:
         """Interpolate shape from nearest edge or view."""
         min_dist = float('inf')
         best_shape = None
-        for view in stroke.key_views:
+        for view in stroke.normalized_shapes:
             dist = math.sqrt((view[0] - target_view[0])**2 + (view[1] - target_view[1])**2)
             if dist < min_dist:
                 min_dist = dist
-                best_shape = stroke.key_views[view]
+                best_shape = stroke.normalized_shapes[view]
         return best_shape
 
     def interpolate_shape(self, stroke_id: str, target_camera: Camera) -> Optional[np.ndarray]:
-        """Interpolate stroke shape for target camera view."""
+        """Interpolate stroke shape and position for target camera view with separated transforms."""
         stroke = self.strokes.get(stroke_id)
         if not stroke:
             return None
+        
         target_view = (target_camera.yaw, target_camera.pitch)
+        
         if not self._is_visible(stroke, target_view):
             return None
+        
+        # Return exact match if available
         if target_view in stroke.key_views:
             return stroke.key_views[target_view]
-        if self.delaunay is None or len(stroke.key_views) < 2:
-            return self._interpolate_nearest_edge(stroke, target_view)
+        
+        # Fallback to nearest neighbor if insufficient data
+        if self.delaunay is None or len(stroke.normalized_shapes) < 2:
+            normalized_shape = self._interpolate_nearest_edge(stroke, target_view)
+            if normalized_shape is None:
+                return None
+            # Use a consistent centroid (e.g., image center) for fallback
+            centroid = np.array([self.image_width/2, self.image_height/2])
+            return normalized_shape + centroid
+        
+        # Find triangle containing target view
         target_point = np.array(target_view).reshape(1, -1)
         simplex_idx = self.delaunay.find_simplex(target_point)
+        
         if simplex_idx[0] != -1:
             triangle_indices = self.delaunay.simplices[simplex_idx[0]]
             triangle_views = [tuple(self.delaunay.points[i]) for i in triangle_indices]
-            available_map = {v: s for v, s in zip(triangle_views, [stroke.key_views.get(v) for v in triangle_views]) if s is not None}
+            
+            # Filter available views and shapes
+            available_map = {v: s for v, s in zip(triangle_views, 
+                            [stroke.normalized_shapes.get(v) for v in triangle_views]) 
+                            if s is not None}
             available_views = list(available_map.keys())
             available_shapes = list(available_map.values())
+            
             if len(available_views) == 0:
-                return self._interpolate_nearest_edge(stroke, target_view)
+                normalized_shape = self._interpolate_nearest_edge(stroke, target_view)
+                if normalized_shape is None:
+                    return None
+                centroid = np.array([self.image_width/2, self.image_height/2])
+                return normalized_shape + centroid
             elif len(available_views) == 1:
-                return available_shapes[0]
+                # Use consistent centroid instead of original view's centroid
+                if stroke.anchor_3d is not None:
+                    # Project 3D anchor to 2D for consistent positioning
+                    centroid = self._project_3d_to_2d(stroke.anchor_3d, target_camera)
+                else:
+                    centroid = stroke.centroids[available_views[0]]
+                return available_shapes[0] + centroid
+            
+            # Calculate barycentric coordinates
             transform = self.delaunay.transform[simplex_idx[0]]
             bary = transform[:2].dot(target_point[0] - transform[2])
             bary = np.append(bary, 1 - bary.sum())
+            
             weight_map = {triangle_views[i]: bary[i] for i in range(3)}
             weights = np.array([weight_map[v] for v in available_views], dtype=float)
             weights = weights / weights.sum()
+            
+            # Interpolate ONLY the normalized shapes (relative to centroid)
             min_points = min(len(shape) for shape in available_shapes)
-            aligned_shapes = [self._resample_path(shape, min_points) if len(shape) != min_points else shape for shape in available_shapes]
-            interpolated = self._advanced_interpolate(aligned_shapes, weights)
+            aligned_shapes = [self._resample_path(shape, min_points) if len(shape) != min_points 
+                            else shape for shape in available_shapes]
+            interpolated_shape = self._advanced_interpolate(aligned_shapes, weights)
+            
+            # Special handling for circular strokes like face
+            if stroke_id == 'face' and available_views:
+                radii = np.array([stroke.radii.get(v, 1.0) for v in available_views])
+                interpolated_radius = np.average(radii, weights=weights)
+                num_points = min_points
+                angles = np.linspace(0, 2*np.pi, num_points, endpoint=False)
+                # Create perfect circle in normalized space
+                interpolated_shape = np.column_stack([
+                    interpolated_radius * np.cos(angles), 
+                    interpolated_radius * np.sin(angles)
+                ])
+            
+            # Determine target centroid based on 3D anchor projection
+            if stroke.anchor_3d is not None:
+                # Project 3D anchor point to 2D screen space for target view
+                target_centroid = self._project_3d_to_2d(stroke.anchor_3d, target_camera)
+            else:
+                # Fallback: interpolate centroids (less preferred)
+                centroids = np.array([stroke.centroids[v] for v in available_views])
+                target_centroid = np.average(centroids, axis=0, weights=weights)
+            
+            # Combine normalized shape with target centroid
+            final_points = interpolated_shape + target_centroid
+            
+            # Apply area scaling if needed
             area_targets = np.array([stroke.areas.get(v, 0.0) for v in available_views], dtype=float)
             area_target = float(np.dot(weights, area_targets))
-            area_cur = abs(_polygon_area(interpolated))
+            area_cur = abs(_polygon_area(final_points))
+            
             if area_cur > 1e-8 and area_target > 1e-8:
                 scale = math.sqrt(area_target / area_cur)
-                c = np.mean(interpolated, axis=0, keepdims=True)
-                interpolated = (interpolated - c) * scale + c
-            return interpolated
-        return self._interpolate_nearest_edge(stroke, target_view)
+                final_points = (final_points - target_centroid) * scale + target_centroid
+            
+            return final_points
+        
+        # Fallback case
+        normalized_shape = self._interpolate_nearest_edge(stroke, target_view)
+        if normalized_shape is None:
+            return None
+        
+        if stroke.anchor_3d is not None:
+            centroid = self._project_3d_to_2d(stroke.anchor_3d, target_camera)
+        else:
+            centroid = np.array([self.image_width/2, self.image_height/2])
+        
+        return normalized_shape + centroid
+    
+    def _project_3d_to_2d(self, point_3d: np.ndarray, camera: Camera) -> np.ndarray:
+        """Project a 3D point to 2D screen coordinates using camera parameters."""
+        # Vector from camera to 3D point
+        to_point = point_3d - camera.position
+        
+        # Project onto camera's right and up vectors
+        x_proj = np.dot(to_point, camera.right)
+        y_proj = np.dot(to_point, camera.up)
+        
+        # Convert to screen coordinates
+        screen_x = self.image_width / 2 + x_proj
+        screen_y = self.image_height / 2 + y_proj
+        
+        return np.array([screen_x, screen_y])
+
+    def center_views_with_anchor_alignment(self):
+        """Alternative centering method that aligns views based on 3D anchors."""
+        # First compute 3D anchors
+        self.compute_3d_anchors()
+        
+        # For each view, adjust stroke positions based on projected anchors
+        for view in self.key_views:
+            camera = Camera(view[0], view[1], self.image_width, self.image_height)
+            
+            for stroke_id, stroke in self.strokes.items():
+                if view in stroke.key_views and stroke.anchor_3d is not None:
+                    # Project 3D anchor to this view
+                    projected_center = self._project_3d_to_2d(stroke.anchor_3d, camera)
+                    
+                    # Get current centroid
+                    current_centroid = stroke.centroids[view]
+                    
+                    # Calculate shift needed
+                    shift = projected_center - current_centroid
+                    
+                    # Apply shift
+                    stroke.key_views[view] += shift
+                    stroke.centroids[view] = projected_center
+                    stroke.normalized_shapes[view] = stroke.key_views[view] - projected_center
+                    stroke.areas[view] = abs(_polygon_area(stroke.key_views[view]))
 
     def create_group(self, group_id: str, members: List[str], parent_group: Optional[str] = None):
         """Create a group of strokes or sub-groups."""
@@ -444,7 +573,7 @@ def parse_svg_file(svg_file: str, view_prefix: str = "") -> Tuple[Dict[str, np.n
                     break
                 current = parent_map.get(current)
             original_id = elem.get('id')
-            stroke_id = f"{view_prefix}{original_id}" if original_id else f"{view_prefix}shape_{len(order)}"
+            stroke_id = original_id if original_id else f"shape_{len(order)}"
             points = None
             if elem.tag.endswith('path'):
                 d = elem.get('d', '')
@@ -579,15 +708,24 @@ def generate_12_view_orientation_space(model: CartoonModel2_5D):
                 for stroke_id, stroke in model.strokes.items():
                     if source_view in stroke.key_views:
                         original_shape = stroke.key_views[source_view]
-                        mirrored_shape = original_shape.copy()
+                        centroid = stroke.centroids[source_view]
+                        normalized_shape = stroke.normalized_shapes[source_view]
                         center_x = model.image_width / 2
                         center_y = model.image_height / 2
+                        mirrored_shape = normalized_shape.copy()
+                        mirrored_centroid = centroid.copy()
                         if view in [(math.pi, 0), (math.pi/2, 0)]:
-                            mirrored_shape[:, 0] = 2 * center_x - mirrored_shape[:, 0]
+                            mirrored_shape[:, 0] = -mirrored_shape[:, 0]
+                            mirrored_centroid[0] = 2 * center_x - centroid[0]
                         elif view == (0, -math.pi/2):
-                            mirrored_shape[:, 1] = 2 * center_y - mirrored_shape[:, 1]
-                        stroke.key_views[view] = mirrored_shape
-                        stroke.areas[view] = abs(_polygon_area(mirrored_shape))
+                            mirrored_shape[:, 1] = -mirrored_shape[:, 1]
+                            mirrored_centroid[1] = 2 * center_y - centroid[1]
+                        stroke.key_views[view] = mirrored_shape + mirrored_centroid
+                        stroke.normalized_shapes[view] = mirrored_shape
+                        stroke.centroids[view] = mirrored_centroid
+                        stroke.areas[view] = abs(_polygon_area(stroke.key_views[view]))
+                        if source_view in stroke.radii:
+                            stroke.radii[view] = stroke.radii[source_view]
                         print(f"Mirrored stroke {stroke_id} from {source_view} to {view}")
     
     print(f"Generated {len(mirrored_views)} mirrored views: {mirrored_views}")
@@ -620,17 +758,23 @@ def generate_12_view_orientation_space(model: CartoonModel2_5D):
             for stroke_id, stroke in model.strokes.items():
                 if source_view in stroke.key_views:
                     original_shape = stroke.key_views[source_view]
+                    centroid = stroke.centroids[source_view]
+                    normalized_shape = stroke.normalized_shapes[source_view]
                     center = np.array([model.image_width / 2, model.image_height / 2])
                     rotation_angle = yaw
-                    rotated_shape = original_shape.copy()
-                    rotated_shape -= center
-                    cos_a = math.cos(rotation_angle)
-                    sin_a = math.sin(rotation_angle)
-                    rotation_matrix = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-                    rotated_shape = np.dot(rotated_shape, rotation_matrix.T)
-                    rotated_shape += center
-                    stroke.key_views[view] = rotated_shape
-                    stroke.areas[view] = abs(_polygon_area(rotated_shape))
+                    rotation_matrix = np.array([
+                        [math.cos(rotation_angle), -math.sin(rotation_angle)],
+                        [math.sin(rotation_angle), math.cos(rotation_angle)]
+                    ])
+                    rotated_shape = np.dot(normalized_shape, rotation_matrix)  # Removed .T to keep shape (100, 2)
+                    relative_centroid = centroid - center
+                    rotated_centroid = center + np.dot(relative_centroid, rotation_matrix)
+                    stroke.key_views[view] = rotated_shape + rotated_centroid[np.newaxis, :]  # Broadcast centroid
+                    stroke.normalized_shapes[view] = rotated_shape
+                    stroke.centroids[view] = rotated_centroid
+                    stroke.areas[view] = abs(_polygon_area(stroke.key_views[view]))
+                    if source_view in stroke.radii:
+                        stroke.radii[view] = stroke.radii[source_view]
                     print(f"Rotated stroke {stroke_id} from {source_view} to {view}")
     
     print(f"Generated {len(rotated_views)} rotated views: {rotated_views}")
@@ -831,7 +975,7 @@ def main():
     model.create_group('earsFace', ['rightEar', 'leftEar', 'face'], 'head')
     model.create_group('head', ['eyes', 'earsFace', 'nose', 'mouth'])
     
-    novel_camera = Camera(yaw=math.pi/6, pitch=0)  # Adjusted to valid angle
+    novel_camera = Camera(yaw=55, pitch=88)
     rendered, novel_order = model.render_novel_view(novel_camera)
     export_svg(rendered, front_styles, model.image_width, model.image_height, "novel_view.svg", novel_order)
     
