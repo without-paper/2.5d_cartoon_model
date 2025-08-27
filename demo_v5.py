@@ -831,7 +831,7 @@ def main():
     model.create_group('earsFace', ['rightEar', 'leftEar', 'face'], 'head')
     model.create_group('head', ['eyes', 'earsFace', 'nose', 'mouth'])
     
-    novel_camera = Camera(yaw=math.pi/6, pitch=0)  # Adjusted to valid angle
+    novel_camera = Camera(yaw=math.pi/6, pitch=math.pi/6)  # Adjusted to valid angle
     rendered, novel_order = model.render_novel_view(novel_camera)
     export_svg(rendered, front_styles, model.image_width, model.image_height, "novel_view.svg", novel_order)
     

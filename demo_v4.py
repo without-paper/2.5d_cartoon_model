@@ -1366,7 +1366,6 @@ def main():
     model.create_group('earsFace', ['front_rightEar', 'front_leftEar', 'front_face', 'top_rightEar', 'top_leftEar', 'top_face', 'right_rightEar', 'right_leftEar', 'right_face'], 'head')
     model.create_group('head', ['eyes', 'earsFace', 'front_nose', 'front_mouth', 'top_nose', 'top_mouth', 'right_nose', 'right_mouth'])
     
-    # Note: render_novel_view is missing, commenting out
     novel_camera = Camera(yaw=math.pi/6, pitch=math.pi/6)
     rendered = model.render_novel_view(novel_camera)
     merged_styles = {}
