@@ -13,6 +13,7 @@ from svg.path import parse_path
 import os
 import re
 import uuid
+import argparse
 
 class Camera:
     """Camera class representing the viewpoint in spherical coordinates around the character's center."""
@@ -886,10 +887,22 @@ def main():
     model.create_group('eyes', ['rightEye', 'leftEye'])
     model.create_group('earsFace', ['rightEar', 'leftEar', 'face'], 'head')
     model.create_group('head', ['eyes', 'earsFace', 'nose', 'mouth'])
+
+    parser = argparse.ArgumentParser(description="Run 2.5D Cartoon Model novel view rendering")
+    parser.add_argument("--yaw", type=float, default=0.0, help="Yaw angle in degrees")
+    parser.add_argument("--pitch", type=float, default=0.0, help="Pitch angle in degrees")
+    parser.add_argument("--output_dir", type=str, default="outputs_grouping", help="Directory to save visualizations")
+    args = parser.parse_args()
+
+    yaw = math.radians(args.yaw)
+    pitch = math.radians(args.pitch)
     
-    novel_camera = Camera(yaw=55, pitch=88)
+    novel_camera = Camera(yaw=yaw, pitch=pitch)
     rendered, novel_order = model.render_novel_view(novel_camera)
-    export_svg(rendered, front_styles, model.image_width, model.image_height, "novel_view.svg", novel_order)
+
+    output_path = f"{args.output_dir}/novel_view_yaw_{args.yaw:.0f}_pitch_{args.pitch:.0f}.svg"
+    export_svg(rendered, front_styles, model.image_width, model.image_height, output_path, novel_order)
+
     
     print("2.5D model created successfully!")
     print(f"Visualizations saved to: {output_dir}")
