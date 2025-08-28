@@ -4,7 +4,7 @@ This repository is an attempt to reproduce the work:
 
 **[2.5D Cartoon Models](http://www.alecrivers.com/2.5dcartoonmodels/)**  
 *Alec Rivers, Takeo Igarashi, Frédo Durand*  
-SIGGRAPH 2010 (to appear)  
+SIGGRAPH 2010
 
 ---
 
@@ -16,7 +16,7 @@ Implemented features include:
 - **Grouping**
 - **3D Anchor Computation**
 
-Some small issues still remain in the results, which may be refined and optimized later.
+Some issues still remain in the results, which may be refined and optimized later.
 
 ---
 

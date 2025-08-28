@@ -1,0 +1,5 @@
+# Ignore cleaned data
+cleaned_data/
+
+# Ignore revision versions
+revision_version/
