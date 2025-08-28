@@ -2,7 +2,7 @@
 
 This repository is an attempt to reproduce the work:  
 
-**2.5D Cartoon Models (2mb)**  
+**[2.5D Cartoon Models](http://www.alecrivers.com/2.5dcartoonmodels/)**  
 *Alec Rivers, Takeo Igarashi, Frédo Durand*  
 SIGGRAPH 2010 (to appear)  
 
@@ -100,5 +100,5 @@ It is recommended to try both and compare the output.
 ## Acknowledgement
 
 This work is based on:
-**2.5D Cartoon Models (2mb)**, Alec Rivers, Takeo Igarashi, Frédo Durand. SIGGRAPH 2010.
+**[2.5D Cartoon Models](http://www.alecrivers.com/2.5dcartoonmodels/)**, Alec Rivers, Takeo Igarashi, Frédo Durand. SIGGRAPH 2010.
 
